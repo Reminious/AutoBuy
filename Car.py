@@ -35,15 +35,30 @@ class ColorFormatter(logging.Formatter):
         color = self.LEVEL_COLORS.get(record.levelno, "")
         reset = Style.RESET_ALL
         record.levelname = f"{color}{record.levelname}{reset}"
-        record.msg = f"{color}{record.msg}{reset}"
         return super().format(record)
 
 
 logger = logging.getLogger("autobuy")
 logger.setLevel(logging.DEBUG)
 _handler = logging.StreamHandler()
-_handler.setFormatter(ColorFormatter(fmt="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+_handler.setFormatter(
+    ColorFormatter(fmt="%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s", datefmt="%H:%M:%S"))
 logger.addHandler(_handler)
+
+COMP_COLORS = {
+    "CORE": Fore.WHITE + Style.BRIGHT,
+    "DETECT": Fore.MAGENTA + Style.BRIGHT,
+    "BUY": Fore.GREEN + Style.BRIGHT,
+    "EMAIL": Fore.BLUE + Style.BRIGHT,
+    "STATS": Fore.CYAN + Style.BRIGHT,
+}
+
+
+def clog(level, comp, msg):
+    c = COMP_COLORS.get(comp, "")
+    reset = Style.RESET_ALL
+    logger.log(level, f"{c}[{comp}]{reset} {msg}")
+
 
 # -------------------- PyAutoGUI Settings --------------------
 pyautogui.PAUSE = 0.05
@@ -79,7 +94,7 @@ def check_color(x, y, color):
 class EmailJob:
 
 
-    def __init__(self, to_addr, subject, html_body, screenshot_path):
+    def __init__(self, to_addr, subject, html_body, screenshot_path=None):
         self.to_addr = to_addr
         self.subject = subject
         self.html_body = html_body
@@ -118,9 +133,10 @@ class EmailSender:
     def send_async(self, job: EmailJob):
         try:
             self.queue.put_nowait(job)
-            logger.info(f"[MAIL] queued: {os.path.basename(job.screenshot_path)}")
+            clog(logging.INFO, "EMAIL",
+                 f"queued: {os.path.basename(job.screenshot_path) if job.screenshot_path else '(no attachment)'}")
         except queue.Full:
-            logger.warning("[MAIL] queue full, fallback to cache on disk")
+            clog(logging.WARNING, "EMAIL", "queue full, fallback to cache on disk")
             self._cache_to_disk(job)
 
 
@@ -132,11 +148,11 @@ class EmailSender:
                 continue
             try:
                 self._send(job)
-                if os.path.exists(job.screenshot_path):
+                if job.screenshot_path and os.path.exists(job.screenshot_path):
                     os.remove(job.screenshot_path)
-                logger.info("[MAIL] sent successfully")
+                clog(logging.INFO, "EMAIL", "sent successfully")
             except Exception as e:
-                logger.error(f"[MAIL] send failed: {e}")
+                clog(logging.ERROR, "EMAIL", f"send failed: {e}")
                 self._cache_to_disk(job)
             finally:
                 self.queue.task_done()
@@ -152,23 +168,21 @@ class EmailSender:
                     with open(meta_path, "r", encoding="utf-8") as f:
                         meta = json.load(f)
                     shot_path = meta.get("screenshot_path")
-                    if shot_path and os.path.exists(shot_path):
-                        job = EmailJob(
-                            to_addr=meta.get("to_addr"),
-                            subject=meta.get("subject"),
-                            html_body=meta.get("html_body"),
-                            screenshot_path=shot_path
-                        )
-                        try:
-                            self.queue.put_nowait(job)
-                            os.remove(meta_path)
-                            logger.debug(f"[MAIL] re-queued cached job: {os.path.basename(shot_path)}")
-                        except queue.Full:
-                            logger.warning("[MAIL] queue still full, keep cached")
-                    else:
+                    job = EmailJob(
+                        to_addr=meta.get("to_addr"),
+                        subject=meta.get("subject"),
+                        html_body=meta.get("html_body"),
+                        screenshot_path=shot_path if shot_path else None
+                    )
+                    try:
+                        self.queue.put_nowait(job)
                         os.remove(meta_path)
+                        clog(logging.DEBUG, "EMAIL",
+                             f"re-queued cached job: {os.path.basename(shot_path) if shot_path else '(no attachment)'}")
+                    except queue.Full:
+                        clog(logging.WARNING, "EMAIL", "queue still full, keep cached")
             except Exception as e:
-                logger.error(f"[MAIL] scan failed: {e}")
+                clog(logging.ERROR, "EMAIL", f"scan failed: {e}")
             for _ in range(int(self.scan_interval * 10)):
                 if self.stop_event.is_set():
                     break
@@ -176,7 +190,8 @@ class EmailSender:
 
 
     def _cache_to_disk(self, job: EmailJob):
-        base = os.path.splitext(os.path.basename(job.screenshot_path))[0]
+        base = os.path.splitext(os.path.basename(job.screenshot_path))[
+            0] if job.screenshot_path else f"job_{int(time.time() * 1000)}"
         meta_path = os.path.join(self.retry_dir, f"{base}.json")
         data = {
             "to_addr": job.to_addr,
@@ -188,9 +203,9 @@ class EmailSender:
         try:
             with open(meta_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            logger.info(f"[MAIL] cached job to disk: {os.path.basename(meta_path)}")
+            clog(logging.INFO, "EMAIL", f"cached job to disk: {os.path.basename(meta_path)}")
         except Exception as e:
-            logger.error(f"[MAIL] failed to write cache meta: {e}")
+            clog(logging.ERROR, "EMAIL", f"failed to write cache meta: {e}")
 
 
     def _send(self, job: EmailJob):
@@ -203,11 +218,12 @@ class EmailSender:
         alt.attach(MIMEText(job.html_body, 'html'))
         msg.attach(alt)
 
-        with open(job.screenshot_path, 'rb') as img:
-            msg_image = MIMEImage(img.read())
-            msg_image.add_header('Content-ID', '<screenshot>')
-            msg_image.add_header('Content-Disposition', 'inline')
-            msg.attach(msg_image)
+        if job.screenshot_path and os.path.exists(job.screenshot_path):
+            with open(job.screenshot_path, 'rb') as img:
+                msg_image = MIMEImage(img.read())
+                msg_image.add_header('Content-ID', '<screenshot>')
+                msg_image.add_header('Content-Disposition', 'inline')
+                msg.attach(msg_image)
 
         server = None
         try:
@@ -226,7 +242,7 @@ class EmailSender:
 class Stats:
 
 
-    def __init__(self, log_interval_sec=30):
+    def __init__(self, log_interval_sec=30, milestone=1000, milestone_cb=None):
         self.no_sale_visits = 0
         self.purchase_attempts = 0
         self.purchase_failures = 0
@@ -240,6 +256,9 @@ class Stats:
         self._log_interval = log_interval_sec
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="stats-reporter")
+
+        self._milestone = milestone
+        self._milestone_cb = milestone_cb
 
 
     def start(self):
@@ -256,8 +275,16 @@ class Stats:
 
 
     def mark_no_sale(self):
+        snapshot_for_cb = None
+        reached = False
         with self._lock:
             self.no_sale_visits += 1
+            if self._milestone and self.no_sale_visits % self._milestone == 0:
+                snapshot_for_cb = self._snapshot_unlocked()
+                reached = True
+        if reached and self._milestone_cb:
+            threading.Thread(target=self._milestone_cb, args=(snapshot_for_cb,),
+                             daemon=True, name="stats-milestone-cb").start()
 
 
     def mark_purchase_attempt(self):
@@ -281,27 +308,32 @@ class Stats:
 
     def snapshot(self):
         with self._lock:
-            avg = (self._first_sale_total_secs / self._first_sale_count) if self._first_sale_count else 0.0
-            return {
-                "no_sale_visits": self.no_sale_visits,
-                "purchase_attempts": self.purchase_attempts,
-                "purchase_failures": self.purchase_failures,
-                "avg_time_to_first_sale_sec": round(avg, 2),
-                "first_sale_samples": self._first_sale_count,
-            }
+            return self._snapshot_unlocked()
+
+
+    def _snapshot_unlocked(self):
+        avg_time = (self._first_sale_total_secs / self._first_sale_count) if self._first_sale_count > 0 else 0.0
+        return {
+            "no_sale_visits": self.no_sale_visits,
+            "purchase_attempts": self.purchase_attempts,
+            "purchase_failures": self.purchase_failures,
+            "avg_time_to_first_sale_sec": round(avg_time, 2),
+            "first_sale_samples": self._first_sale_count,
+            "timestamp": datetime.now().isoformat() + "Z"
+        }
 
 
     def _loop(self):
         while not self._stop.is_set():
             time.sleep(self._log_interval)
             snap = self.snapshot()
-            logger.info(
-                f"[STATS] no_sale={snap['no_sale_visits']} "
-                f"attempts={snap['purchase_attempts']} "
-                f"failures={snap['purchase_failures']} "
-                f"avg_time_to_first_sale={snap['avg_time_to_first_sale_sec']}s "
-                f"(n={snap['first_sale_samples']})"
-            )
+            clog(logging.INFO, "STATS",
+                 f"no_sale={snap['no_sale_visits']} "
+                 f"attempts={snap['purchase_attempts']} "
+                 f"failures={snap['purchase_failures']} "
+                 f"avg_time_to_first_sale={snap['avg_time_to_first_sale_sec']}s "
+                 f"(n={snap['first_sale_samples']})"
+                 )
 
 
 # -------------------- Cleanup and Shutdown --------------------
@@ -334,7 +366,6 @@ def _cleanup():
 
 
 def _shutdown_now():
-    from_time = time.time()
     global _EXITING
     if _EXITING:
         return
@@ -354,14 +385,18 @@ def _shutdown_now():
         pass
 
     _cleanup()
-    logger.info(">>> Exiting now...")
+    clog(logging.INFO, "CORE", ">>> Exiting now...")
+    try:
+        time.sleep(1)
+    except Exception:
+        pass
     os._exit(0)
 
 
 def hard_kill():
     if _EXITING:
         return
-    logger.warning("F12 detected — stopping script immediately.")
+    clog(logging.WARNING, "CORE", "F12 detected — stopping script immediately.")
     t = threading.Thread(target=_shutdown_now, daemon=True, name="hard_kill")
     t.start()
 
@@ -370,7 +405,7 @@ keyboard.add_hotkey('f12', hard_kill, suppress=True)
 
 
 def _sig_handler(signum, frame):
-    logger.warning(f"Signal {signum} received — stopping script.")
+    clog(logging.WARNING, "CORE", f"Signal {signum} received — stopping script.")
     _shutdown_now()
 
 
@@ -386,7 +421,32 @@ except Exception:
 # -------------------- Email sender & Stats instances --------------------
 email_sender = EmailSender(user=mail_user, password=mail_password, retry_dir="outbox", scan_interval=60)
 email_sender.start()
-stats = Stats(log_interval_sec=30)
+
+
+def send_stats_email_async(snapshot: dict):
+    html = f"""
+    <h3>AutoBuy Stats Milestone</h3>
+    <p>Reached <b>{snapshot['no_sale_visits']}</b> no-sale visits.</p>
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;">
+      <tr><th align="left">Timestamp (UTC)</th><td>{snapshot['timestamp']}</td></tr>
+      <tr><th align="left">No-sale visits</th><td>{snapshot['no_sale_visits']}</td></tr>
+      <tr><th align="left">Purchase attempts</th><td>{snapshot['purchase_attempts']}</td></tr>
+      <tr><th align="left">Purchase failures</th><td>{snapshot['purchase_failures']}</td></tr>
+      <tr><th align="left">Avg time to first sale (s)</th><td>{snapshot['avg_time_to_first_sale_sec']}</td></tr>
+      <tr><th align="left">First-sale samples</th><td>{snapshot['first_sale_samples']}</td></tr>
+    </table>
+    """
+    job = EmailJob(
+        to_addr=mail_user,
+        subject=f"AutoBuy Stats — No-sale={snapshot['no_sale_visits']}",
+        html_body=html,
+        screenshot_path=None,
+    )
+    clog(logging.INFO, "EMAIL", f"sending milestone stats email for no_sale={snapshot['no_sale_visits']}")
+    email_sender.send_async(job)
+
+
+stats = Stats(log_interval_sec=30, milestone=1000, milestone_cb=send_stats_email_async)
 stats.start()
 
 
@@ -409,21 +469,26 @@ def send_email_async_with_shot():
 def main_script():
     while True:
         stats.mark_enter_main()
+        clog(logging.DEBUG, "DETECT", "Waiting for MAIN screen...")
 
         # Loop until the main screen is detected
         while not check_color(1900, 420, (247, 247, 247)):
             time.sleep(0.5)  # Wait a bit before rechecking
 
         # On the main screen, press Enter twice
+        clog(logging.INFO, "DETECT", "MAIN screen detected.")
         time.sleep(1)
         pyautogui.press('enter', presses=2, interval=0.5)
 
         # Loop until no lag is detected
+        clog(logging.DEBUG, "DETECT", "Waiting for NO-LAG state...")
         while not (check_color(1678, 701, (255, 255, 255)) or check_color(2360, 476, (247, 247, 247))):
             time.sleep(0.5)  # Wait a bit before rechecking
+        clog(logging.INFO, "DETECT", "NO-LAG state detected.")
 
         # Check if car is on sale
         if check_color(1000, 325, (247, 247, 247)):
+            clog(logging.INFO, "DETECT", "CAR ON SALE detected.")
             stats.mark_first_sale_seen()
 
             # If available, keep pressing Y until enter the buying screen
@@ -433,29 +498,31 @@ def main_script():
 
             # Try to buy
             if not check_color(1700, 885, (247, 247, 247)):
-                logger.info("Car not available any more, returning to main screen...")
+                clog(logging.WARNING, "BUY", "Car unavailable, back to MAIN.")
                 pyautogui.press('esc', presses=2, interval=0.5)
                 stats.mark_purchase_attempt()
                 stats.mark_purchase_failure()
                 continue
 
             stats.mark_purchase_attempt()
+            clog(logging.INFO, "BUY", "Proceeding to BUY: navigating and confirming...")
             pyautogui.press('down')
             time.sleep(0.2)
             pyautogui.press('enter', presses=2, interval=0.2)
 
             # Wait to see if buying is successful
+            clog(logging.DEBUG, "BUY", "Waiting for purchase result...")
             time.sleep(10)
 
             # Failed buying, exit to main screen and try again
             if not check_color(1559, 772, (247, 247, 247)):
-                logger.warning("Buying failed, retrying...")
+                clog(logging.WARNING, "BUY", "Buying failed. Back to MAIN...")
                 stats.mark_purchase_failure()
                 pyautogui.press('enter')
                 time.sleep(0.5)
                 pyautogui.press('esc', presses=2, interval=0.5)
             else:
-                logger.info("Buying successful, exiting script.")
+                clog(logging.INFO, "BUY", "Buying SUCCESS. Doing final navigation and notification...")
                 pyautogui.press('enter')
                 time.sleep(0.5)
                 pyautogui.press('esc', presses=2, interval=0.5)
@@ -472,16 +539,17 @@ def main_script():
         # If no car is on sale, press Esc to return to the main screen
         else:
             stats.mark_no_sale()
+            clog(logging.INFO, "DETECT", "No car on sale. Returning to MAIN (Esc).")
             pyautogui.press('esc')
 
 
 # -------------------- Entry Point --------------------
 if __name__ == "__main__":
-    print("Press F12 at any time to stop the script.")
+    clog(logging.INFO, "CORE", "Press F12 at any time to stop the script.")
     try:
         main_script()
     except pyautogui.FailSafeException:
-        logger.warning("PyAutoGUI FailSafe triggered — stopping.")
+        clog(logging.WARNING, "CORE", "PyAutoGUI FailSafe triggered — stopping.")
         _shutdown_now()
     except KeyboardInterrupt:
         _shutdown_now()
