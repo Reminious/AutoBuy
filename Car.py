@@ -10,6 +10,7 @@ from datetime import datetime
 from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from time import sleep
 
 import keyboard
 import pyautogui
@@ -61,7 +62,6 @@ def clog(level, comp, msg):
 
 
 # -------------------- PyAutoGUI Settings --------------------
-pyautogui.PAUSE = 0.05
 pyautogui.FAILSAFE = True
 
 # -------------------- Global Variables --------------------
@@ -125,6 +125,10 @@ class EmailSender:
 
     def shutdown(self, wait_seconds=1.0):
         self.stop_event.set()
+        try:
+            self.queue.join()
+        except Exception:
+            pass
         t0 = time.time()
         while not self.queue.empty() and (time.time() - t0) < wait_seconds:
             time.sleep(0.05)
@@ -145,6 +149,8 @@ class EmailSender:
             try:
                 job = self.queue.get(timeout=0.2)
             except queue.Empty:
+                if self.stop_event.is_set():
+                    break
                 continue
             try:
                 self._send(job)
@@ -242,7 +248,7 @@ class EmailSender:
 class Stats:
 
 
-    def __init__(self, log_interval_sec=30, milestone=1000, milestone_cb=None):
+    def __init__(self, log_interval_sec=30, milestone=300, milestone_cb=None):
         self.no_sale_visits = 0
         self.purchase_attempts = 0
         self.purchase_failures = 0
@@ -380,7 +386,7 @@ def _shutdown_now():
     except Exception:
         pass
     try:
-        email_sender.shutdown(wait_seconds=1.0)
+        email_sender.shutdown(wait_seconds=5.0)
     except Exception:
         pass
 
@@ -446,7 +452,7 @@ def send_stats_email_async(snapshot: dict):
     email_sender.send_async(job)
 
 
-stats = Stats(log_interval_sec=30, milestone=1000, milestone_cb=send_stats_email_async)
+stats = Stats(log_interval_sec=30, milestone=300, milestone_cb=send_stats_email_async)
 stats.start()
 
 
@@ -532,6 +538,7 @@ def main_script():
                 pyautogui.press('down')
                 time.sleep(0.5)
                 pyautogui.press('enter')
+                sleep(8)
                 # Notify by email
                 send_email_async_with_shot()
                 _shutdown_now()
