@@ -1,62 +1,149 @@
-import pyautogui
-import time
-import keyboard
-import smtplib
 import os
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import signal
+import smtplib
+import threading
+import time
 from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+import keyboard
+import pyautogui
+
+
+# gmail_user = ""
+# gmail_password = ""
+qq_user = ""
+qq_password = ""
+
+TEMP_SCREENSHOT = None
+CURRENT_SERVER = None
+_CLEANED = False
+_CLEAN_LOCK = threading.Lock()
+
+
+def _cleanup():
+    global TEMP_SCREENSHOT, CURRENT_SERVER, _CLEANED
+    with _CLEAN_LOCK:
+        if _CLEANED:
+            return
+        print(">>> Cleaning up before exit...")
+
+        # Remove temporary screenshot file if it exists
+        if TEMP_SCREENSHOT and os.path.exists(TEMP_SCREENSHOT):
+            try:
+                os.remove(TEMP_SCREENSHOT)
+                print(f">>> Removed temporary file: {TEMP_SCREENSHOT}")
+            except Exception as e:
+                print(f">>> Failed to remove temporary file: {e}")
+            TEMP_SCREENSHOT = None
+
+        # Close SMTP server connection if open
+        if CURRENT_SERVER:
+            try:
+                CURRENT_SERVER.quit()
+                print(">>> Closed SMTP server connection.")
+            except Exception as e:
+                pass
+            CURRENT_SERVER = None
+        _CLEANED = True
+
+
+def _shutdown_now():
+    try:
+        keyboard.unhook_all()
+    except Exception:
+        pass
+    _cleanup()
+    print(">>> Exiting now...")
+    os._exit(0)
+
+
+def hard_kill():
+    print("F12 detected — stopping script immediately.")
+    t = threading.Thread(target=_shutdown_now, daemon=True)
+    t.start()
+
+
+keyboard.add_hotkey('f12', hard_kill, suppress=True)
+
+
+def _sig_handler(signum, frame):
+    print(f"Signal {signum} received — stopping script.")
+    _shutdown_now()
+
+
+try:
+    signal.signal(signal.SIGINT, _sig_handler)  # Ctrl+C
+except Exception:
+    pass
+try:
+    signal.signal(signal.SIGTERM, _sig_handler)  # 终止信号
+except Exception:
+    pass
+
 
 def send_email():
-    to='meta0000ff@gmail.com'
-    subject='Check running result'
-    body='Running ends, check result.<br><br><img src="cid:screenshot">'
-    screenshot_file="screenshot.png"
+    global TEMP_SCREENSHOT, CURRENT_SERVER
+
+    to = '737641891@qq.com'
+    subject = 'Check running result'
+    body = 'Running ends, check result.'
+    screenshot_file = "screenshot.png"
+
+    TEMP_SCREENSHOT = screenshot_file
     pyautogui.screenshot(screenshot_file)
-    msg=MIMEMultipart('related')
-    msg['From']=gmail_user
-    msg['To']=to
-    msg['Subject']=subject
-    msg_alternative=MIMEMultipart('alternative')
+
+    msg = MIMEMultipart('related')
+    msg['From'] = qq_user
+    msg['To'] = to
+    msg['Subject'] = subject
+
+    msg_alternative = MIMEMultipart('alternative')
     msg.attach(msg_alternative)
-    msg_text=MIMEText(body,'html')
+    msg_text = MIMEText(body, 'html')
     msg_alternative.attach(msg_text)
 
-    with open(screenshot_file,'rb') as img:
-        msg_image=MIMEImage(img.read())
-        msg_image.add_header('Content_ID','<screenshot>')
+    with open(screenshot_file, 'rb') as img:
+        msg_image = MIMEImage(img.read())
+        msg_image.add_header('Content-Disposition', 'attachment', filename=os.path.basename(screenshot_file))
         msg.attach(msg_image)
 
     try:
-        server=smtplib.SMTP('smtp.gmail.com',587)
-        server.starttls()
-        server.login(gmail_user,gmail_password)
-        text=msg.as_string()
-        server.sendmail(gmail_user,to,text)
-        server.quit()
+        CURRENT_SERVER = smtplib.SMTP('smtp.qq.com', 587)
+        CURRENT_SERVER.starttls()
+        CURRENT_SERVER.login(qq_user, qq_password)
+        CURRENT_SERVER.sendmail(qq_user, to, msg.as_string())
         print('mail sent')
     except Exception as e:
         print(f'mail sent fail: {e}')
-    os.remove(screenshot_file)
+    finally:
+        if CURRENT_SERVER:
+            try:
+                CURRENT_SERVER.quit()
+            except Exception:
+                pass
+            CURRENT_SERVER = None
+        if TEMP_SCREENSHOT and os.path.exists(TEMP_SCREENSHOT):
+            try:
+                os.remove(TEMP_SCREENSHOT)
+                print("Temp screenshot deleted.")
+            except Exception as e:
+                print(f"Failed to delete screenshot: {e}")
+        TEMP_SCREENSHOT = None
+
 
 def check_color(x, y, color):
-    """Check if the color at a specific screen position matches the given color."""
+    # Check if the color at a specific screen position matches the given color.
     screen_color = pyautogui.screenshot().getpixel((x, y))
     return screen_color == color
 
+
 def main_script():
     while True:
-        # Check if F12 is pressed to stop the script
-        if keyboard.is_pressed('f12'):
-            print("F12 pressed, stopping the script.")
-            break
-
         # Loop until the main screen is detected
         while not check_color(1900, 420, (247, 247, 247)):
             time.sleep(0.5)  # Wait a bit before rechecking
-            if keyboard.is_pressed('f12'):
-                print("F12 pressed, stopping the script.")
-                return
 
         # On the main screen, press Enter twice
         time.sleep(1)
@@ -65,30 +152,58 @@ def main_script():
         # Loop until no lag is detected
         while not (check_color(1678, 701, (255, 255, 255)) or check_color(2360, 476, (247, 247, 247))):
             time.sleep(0.5)  # Wait a bit before rechecking
-            if keyboard.is_pressed('f12'):
-                print("F12 pressed, stopping the script.")
-                return
 
-        # Check for availability
-        if check_color(750, 350, (247, 247, 247)):
-            # If available, keep pressing Enter until a specific condition is met
-            while not check_color(450, 750, (247, 247, 247)):
+        # Check if car is on sale
+        if check_color(1000, 325, (247, 247, 247)):
+            # If available, keep pressing Y until enter the buying screen
+            while check_color(700, 1330, (21, 9, 21)):
+                pyautogui.press('y')
+                time.sleep(0.5)
+
+            # Try to buy
+            if not check_color(1700, 885, (247, 247, 247)):
+                print("Car not available any more, returning to main screen...")
+                pyautogui.press('esc', presses=2, interval=0.5)
+                continue
+
+            pyautogui.press('down')
+            time.sleep(0.2)
+            pyautogui.press('enter', presses=2, interval=0.2)
+
+            # Wait to see if buying is successful
+            time.sleep(10)
+
+            # Notify by email
+            send_email()
+
+            # Failed buying, exit to main screen and try again
+            if not check_color(1559, 772, (247, 247, 247)):
+                print("Buying failed, retrying...")
                 pyautogui.press('enter')
                 time.sleep(0.5)
-                if keyboard.is_pressed('f12'):
-                    print("F12 pressed, stopping the script.")
-                    return
-            # Final sequence of key presses
-            pyautogui.press('down')  # Press down arrow key
-            time.sleep(0.5)
-            pyautogui.press('enter', presses=2, interval=0.5)  # Press Enter twice
-            time.sleep(10)
-            # Failed buying, try again
-            send_email()
+                pyautogui.press('esc', presses=2, interval=0.5)
+            else:
+                print("Buying successful, exiting script.")
+                pyautogui.press('enter')
+                time.sleep(0.5)
+                pyautogui.press('esc', presses=2, interval=0.5)
+                time.sleep(1)
+                pyautogui.press('right')
+                time.sleep(0.5)
+                pyautogui.press('down')
+                time.sleep(0.5)
+                pyautogui.press('enter')
+                _shutdown_now()
+
+        # If no car is on sale, press Esc to return to the main screen
         else:
-            # If not available, press Esc to return to the main screen
             pyautogui.press('esc')
 
 
 # Run the script
-main_script()
+if __name__ == "__main__":
+    print("Press F12 at any time to stop the script.")
+    try:
+        main_script()
+    except KeyboardInterrupt:
+        _shutdown_now()
