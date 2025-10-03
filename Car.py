@@ -9,17 +9,17 @@ from email.mime.text import MIMEText
 
 import keyboard
 import pyautogui
+from dotenv import load_dotenv
 
-
-# gmail_user = ""
-# gmail_password = ""
-qq_user = ""
-qq_password = ""
 
 TEMP_SCREENSHOT = None
 CURRENT_SERVER = None
 _CLEANED = False
 _CLEAN_LOCK = threading.Lock()
+
+load_dotenv(dotenv_path=".env")
+mail_user = os.getenv("MAIL_USER")
+mail_password = os.getenv("MAIL_PASSWORD")
 
 
 def _cleanup():
@@ -95,7 +95,7 @@ def send_email():
     pyautogui.screenshot(screenshot_file)
 
     msg = MIMEMultipart('related')
-    msg['From'] = qq_user
+    msg['From'] = mail_user
     msg['To'] = to
     msg['Subject'] = subject
 
@@ -112,8 +112,8 @@ def send_email():
     try:
         CURRENT_SERVER = smtplib.SMTP('smtp.qq.com', 587)
         CURRENT_SERVER.starttls()
-        CURRENT_SERVER.login(qq_user, qq_password)
-        CURRENT_SERVER.sendmail(qq_user, to, msg.as_string())
+        CURRENT_SERVER.login(mail_user, mail_password)
+        CURRENT_SERVER.sendmail(mail_user, to, msg.as_string())
         print('mail sent')
     except Exception as e:
         print(f'mail sent fail: {e}')
