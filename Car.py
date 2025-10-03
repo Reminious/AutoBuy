@@ -256,6 +256,15 @@ class Stats:
         self._first_sale_count = 0
         self._first_sale_total_secs = 0.0
 
+        self._last_sale_seen_ts = None
+        self._sale_interval_total_secs = 0.0
+        self._sale_interval_count = 0
+
+        self._no_sale_since_enter = 0
+        self._no_sale_before_sale_total = 0
+        self._no_sale_before_sale_count = 0
+        self._last_no_sale_before_sale = 0
+
         self._last_enter_main_ts = None
         self._lock = threading.Lock()
 
@@ -278,6 +287,7 @@ class Stats:
     def mark_enter_main(self):
         with self._lock:
             self._last_enter_main_ts = time.time()
+            self._no_sale_since_enter = 0
 
 
     def mark_no_sale(self):
@@ -285,6 +295,7 @@ class Stats:
         reached = False
         with self._lock:
             self.no_sale_visits += 1
+            self._no_sale_since_enter += 1
             if self._milestone and self.no_sale_visits % self._milestone == 0:
                 snapshot_for_cb = self._snapshot_unlocked()
                 reached = True
@@ -304,12 +315,24 @@ class Stats:
 
 
     def mark_first_sale_seen(self):
+        now = time.time()
         with self._lock:
             if self._last_enter_main_ts:
                 delta = time.time() - self._last_enter_main_ts
                 self._first_sale_total_secs += delta
                 self._first_sale_count += 1
-                self._last_enter_main_ts = None  # 只记录首次在售的耗时，后续不累加
+                self._last_enter_main_ts = None
+
+            self._last_no_sale_before_sale = self._no_sale_since_enter
+            self._no_sale_before_sale_total += self._no_sale_since_enter
+            self._no_sale_before_sale_count += 1
+            self._no_sale_since_enter = 0
+
+            if self._last_sale_seen_ts is not None:
+                interval = now - self._last_sale_seen_ts
+                self._sale_interval_total_secs += interval
+                self._sale_interval_count += 1
+            self._last_sale_seen_ts = now
 
 
     def snapshot(self):
@@ -318,13 +341,20 @@ class Stats:
 
 
     def _snapshot_unlocked(self):
-        avg_time = (self._first_sale_total_secs / self._first_sale_count) if self._first_sale_count > 0 else 0.0
+        avg_time_to_first = (self._first_sale_total_secs / self._first_sale_count) if self._first_sale_count else 0.0
+        avg_sale_interval = (
+                self._sale_interval_total_secs / self._sale_interval_count) if self._sale_interval_count else 0.0
+        avg_no_sale_before_sale = (
+                self._no_sale_before_sale_total / self._no_sale_before_sale_count) if self._no_sale_before_sale_count else 0.0
         return {
             "no_sale_visits": self.no_sale_visits,
             "purchase_attempts": self.purchase_attempts,
             "purchase_failures": self.purchase_failures,
-            "avg_time_to_first_sale_sec": round(avg_time, 2),
+            "avg_time_to_first_sale_sec": round(avg_time_to_first, 2),  # 保留原有指标
             "first_sale_samples": self._first_sale_count,
+            "avg_sale_interval_sec": round(avg_sale_interval, 2),
+            "avg_no_sale_before_sale": round(avg_no_sale_before_sale, 2),
+            "last_no_sale_before_sale": self._last_no_sale_before_sale,
             "timestamp": datetime.now().isoformat() + "Z"
         }
 
@@ -337,8 +367,11 @@ class Stats:
                  f"no_sale={snap['no_sale_visits']} "
                  f"attempts={snap['purchase_attempts']} "
                  f"failures={snap['purchase_failures']} "
-                 f"avg_time_to_first_sale={snap['avg_time_to_first_sale_sec']}s "
-                 f"(n={snap['first_sale_samples']})"
+                 f"avg_first_sale={snap['avg_time_to_first_sale_sec']}s "
+                 f"avg_sale_interval={snap['avg_sale_interval_sec']}s "
+                 f"avg_no_sale_before_sale={snap['avg_no_sale_before_sale']} "
+                 f"last_no_sale_before_sale={snap['last_no_sale_before_sale']} "
+                 f"(first_sale_n={snap['first_sale_samples']})"
                  )
 
 
@@ -434,12 +467,15 @@ def send_stats_email_async(snapshot: dict):
     <h3>AutoBuy Stats Milestone</h3>
     <p>Reached <b>{snapshot['no_sale_visits']}</b> no-sale visits.</p>
     <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;">
-      <tr><th align="left">Timestamp (UTC)</th><td>{snapshot['timestamp']}</td></tr>
-      <tr><th align="left">No-sale visits</th><td>{snapshot['no_sale_visits']}</td></tr>
+      <tr><th align="left">Timestamp</th><td>{snapshot['timestamp']}</td></tr>
+      <tr><th align="left">No-sale visits (total)</th><td>{snapshot['no_sale_visits']}</td></tr>
       <tr><th align="left">Purchase attempts</th><td>{snapshot['purchase_attempts']}</td></tr>
       <tr><th align="left">Purchase failures</th><td>{snapshot['purchase_failures']}</td></tr>
       <tr><th align="left">Avg time to first sale (s)</th><td>{snapshot['avg_time_to_first_sale_sec']}</td></tr>
-      <tr><th align="left">First-sale samples</th><td>{snapshot['first_sale_samples']}</td></tr>
+      <tr><th align="left">Avg sale interval (s)</th><td>{snapshot['avg_sale_interval_sec']}</td></tr>
+      <tr><th align="left">Avg no-sale before sale</th><td>{snapshot['avg_no_sale_before_sale']}</td></tr>
+      <tr><th align="left">Last no-sale before sale</th><td>{snapshot['last_no_sale_before_sale']}</td></tr>
+      <tr><th align="left">First sale samples</th><td>{snapshot['first_sale_samples']}</td></tr>
     </table>
     """
     job = EmailJob(
@@ -457,16 +493,35 @@ stats.start()
 
 
 # -------------------- Main Script Logic --------------------
-def send_email_async_with_shot():
+def send_email_async_with_shot(snapshot):
     screenshot_file = os.path.join("outbox", f"screenshot_{int(time.time() * 1000)}.png")
     os.makedirs("outbox", exist_ok=True)
     pyautogui.screenshot(screenshot_file)
 
+    stats_html = f"""
+    <h3>AutoBuy Stats (at success)</h3>
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;">
+      <tr><th align="left">Timestamp</th><td>{snapshot['timestamp']}</td></tr>
+      <tr><th align="left">No-sale visits (total)</th><td>{snapshot['no_sale_visits']}</td></tr>
+      <tr><th align="left">Purchase attempts</th><td>{snapshot['purchase_attempts']}</td></tr>
+      <tr><th align="left">Purchase failures</th><td>{snapshot['purchase_failures']}</td></tr>
+      <tr><th align="left">Avg time to first sale (s)</th><td>{snapshot['avg_time_to_first_sale_sec']}</td></tr>
+      <tr><th align="left">Avg sale interval (s)</th><td>{snapshot['avg_sale_interval_sec']}</td></tr>
+      <tr><th align="left">Avg no-sale before sale</th><td>{snapshot['avg_no_sale_before_sale']}</td></tr>
+      <tr><th align="left">Last no-sale before sale</th><td>{snapshot['last_no_sale_before_sale']}</td></tr>
+      <tr><th align="left">First sale samples</th><td>{snapshot['first_sale_samples']}</td></tr>
+    </table>
+    """
+
+    html = (
+            '<p>The car purchase was <b>successful</b>. See the screenshot below:</p>'
+            '<img src="cid:screenshot"><br><br>' + stats_html
+    )
+
     job = EmailJob(
         to_addr=mail_user,
         subject='Car Purchase Successful',
-        html_body='<p>The car purchase was successful. See the screenshot below:</p>'
-                  '<img src="cid:screenshot">',
+        html_body=html,
         screenshot_path=screenshot_file
     )
     email_sender.send_async(job)
@@ -539,8 +594,13 @@ def main_script():
                 time.sleep(0.5)
                 pyautogui.press('enter')
                 sleep(8)
+                snap = stats.snapshot()
+                clog(logging.INFO, "STATS",
+                     f"SUCCESS snapshot: avg_sale_interval={snap['avg_sale_interval_sec']}s, "
+                     f"last_no_sale_before_sale={snap['last_no_sale_before_sale']} "
+                     f"(avg={snap['avg_no_sale_before_sale']}, first_sale_n={snap['first_sale_samples']})")
                 # Notify by email
-                send_email_async_with_shot()
+                send_email_async_with_shot(snap)
                 _shutdown_now()
 
         # If no car is on sale, press Esc to return to the main screen
