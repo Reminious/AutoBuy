@@ -253,21 +253,15 @@ class Stats:
         self.purchase_attempts = 0
         self.purchase_failures = 0
 
-        self._first_sale_count = 0
-        self._first_sale_total_secs = 0.0
+        self._program_start_ts = time.time()
+        self._first_sale_ts = None
+        self._time_to_first_sale_from_start_sec = None
+        self._no_sale_before_first_sale = 0
 
-        self._last_sale_seen_ts = None
-        self._sale_interval_total_secs = 0.0
-        self._sale_interval_count = 0
+        self._sale_occurrences = 0
+        self._last_sale_ts = None
 
-        self._no_sale_since_enter = 0
-        self._no_sale_before_sale_total = 0
-        self._no_sale_before_sale_count = 0
-        self._last_no_sale_before_sale = 0
-
-        self._last_enter_main_ts = None
         self._lock = threading.Lock()
-
         self._log_interval = log_interval_sec
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="stats-reporter")
@@ -285,9 +279,7 @@ class Stats:
 
 
     def mark_enter_main(self):
-        with self._lock:
-            self._last_enter_main_ts = time.time()
-            self._no_sale_since_enter = 0
+        pass
 
 
     def mark_no_sale(self):
@@ -295,10 +287,14 @@ class Stats:
         reached = False
         with self._lock:
             self.no_sale_visits += 1
-            self._no_sale_since_enter += 1
+
+            if self._first_sale_ts is None:
+                self._no_sale_before_first_sale += 1
+
             if self._milestone and self.no_sale_visits % self._milestone == 0:
                 snapshot_for_cb = self._snapshot_unlocked()
                 reached = True
+
         if reached and self._milestone_cb:
             threading.Thread(target=self._milestone_cb, args=(snapshot_for_cb,),
                              daemon=True, name="stats-milestone-cb").start()
@@ -317,22 +313,12 @@ class Stats:
     def mark_first_sale_seen(self):
         now = time.time()
         with self._lock:
-            if self._last_enter_main_ts:
-                delta = time.time() - self._last_enter_main_ts
-                self._first_sale_total_secs += delta
-                self._first_sale_count += 1
-                self._last_enter_main_ts = None
+            if self._first_sale_ts is None:
+                self._first_sale_ts = now
+                self._time_to_first_sale_from_start_sec = now - self._program_start_ts
 
-            self._last_no_sale_before_sale = self._no_sale_since_enter
-            self._no_sale_before_sale_total += self._no_sale_since_enter
-            self._no_sale_before_sale_count += 1
-            self._no_sale_since_enter = 0
-
-            if self._last_sale_seen_ts is not None:
-                interval = now - self._last_sale_seen_ts
-                self._sale_interval_total_secs += interval
-                self._sale_interval_count += 1
-            self._last_sale_seen_ts = now
+            self._sale_occurrences += 1
+            self._last_sale_ts = now
 
 
     def snapshot(self):
@@ -341,21 +327,22 @@ class Stats:
 
 
     def _snapshot_unlocked(self):
-        avg_time_to_first = (self._first_sale_total_secs / self._first_sale_count) if self._first_sale_count else 0.0
-        avg_sale_interval = (
-                self._sale_interval_total_secs / self._sale_interval_count) if self._sale_interval_count else 0.0
-        avg_no_sale_before_sale = (
-                self._no_sale_before_sale_total / self._no_sale_before_sale_count) if self._no_sale_before_sale_count else 0.0
+
+        if self._sale_occurrences >= 1 and self._first_sale_ts is not None and self._last_sale_ts is not None:
+            avg_sale_interval = (self._last_sale_ts - self._first_sale_ts) / self._sale_occurrences
+        else:
+            avg_sale_interval = 0.0
+
         return {
             "no_sale_visits": self.no_sale_visits,
             "purchase_attempts": self.purchase_attempts,
             "purchase_failures": self.purchase_failures,
-            "avg_time_to_first_sale_sec": round(avg_time_to_first, 2),  # 保留原有指标
-            "first_sale_samples": self._first_sale_count,
+            "time_to_first_sale_from_start_sec": round(self._time_to_first_sale_from_start_sec or 0.0, 2),
+            "no_sale_before_first_sale": int(self._no_sale_before_first_sale),
             "avg_sale_interval_sec": round(avg_sale_interval, 2),
-            "avg_no_sale_before_sale": round(avg_no_sale_before_sale, 2),
-            "last_no_sale_before_sale": self._last_no_sale_before_sale,
-            "timestamp": datetime.now().isoformat() + "Z"
+            "sale_occurrences": self._sale_occurrences,
+            "first_sale_seen": self._first_sale_ts is not None,
+            "timestamp": datetime.now().isoformat()
         }
 
 
@@ -367,11 +354,10 @@ class Stats:
                  f"no_sale={snap['no_sale_visits']} "
                  f"attempts={snap['purchase_attempts']} "
                  f"failures={snap['purchase_failures']} "
-                 f"avg_first_sale={snap['avg_time_to_first_sale_sec']}s "
+                 f"time_to_first_sale_from_start={snap['time_to_first_sale_from_start_sec']}s "
+                 f"no_sale_before_first_sale={snap['no_sale_before_first_sale']} "
                  f"avg_sale_interval={snap['avg_sale_interval_sec']}s "
-                 f"avg_no_sale_before_sale={snap['avg_no_sale_before_sale']} "
-                 f"last_no_sale_before_sale={snap['last_no_sale_before_sale']} "
-                 f"(first_sale_n={snap['first_sale_samples']})"
+                 f"(occurrences={snap['sale_occurrences']}, first_sale_seen={snap['first_sale_seen']})"
                  )
 
 
@@ -471,11 +457,11 @@ def send_stats_email_async(snapshot: dict):
       <tr><th align="left">No-sale visits (total)</th><td>{snapshot['no_sale_visits']}</td></tr>
       <tr><th align="left">Purchase attempts</th><td>{snapshot['purchase_attempts']}</td></tr>
       <tr><th align="left">Purchase failures</th><td>{snapshot['purchase_failures']}</td></tr>
-      <tr><th align="left">Avg time to first sale (s)</th><td>{snapshot['avg_time_to_first_sale_sec']}</td></tr>
+      <tr><th align="left">Time to FIRST sale from start (s)</th><td>{snapshot['time_to_first_sale_from_start_sec']}</td></tr>
+      <tr><th align="left">No-sale before FIRST sale</th><td>{snapshot['no_sale_before_first_sale']}</td></tr>
       <tr><th align="left">Avg sale interval (s)</th><td>{snapshot['avg_sale_interval_sec']}</td></tr>
-      <tr><th align="left">Avg no-sale before sale</th><td>{snapshot['avg_no_sale_before_sale']}</td></tr>
-      <tr><th align="left">Last no-sale before sale</th><td>{snapshot['last_no_sale_before_sale']}</td></tr>
-      <tr><th align="left">First sale samples</th><td>{snapshot['first_sale_samples']}</td></tr>
+      <tr><th align="left">Sale occurrences</th><td>{snapshot['sale_occurrences']}</td></tr>
+      <tr><th align="left">First sale seen?</th><td>{snapshot['first_sale_seen']}</td></tr>
     </table>
     """
     job = EmailJob(
@@ -505,11 +491,11 @@ def send_email_async_with_shot(snapshot):
       <tr><th align="left">No-sale visits (total)</th><td>{snapshot['no_sale_visits']}</td></tr>
       <tr><th align="left">Purchase attempts</th><td>{snapshot['purchase_attempts']}</td></tr>
       <tr><th align="left">Purchase failures</th><td>{snapshot['purchase_failures']}</td></tr>
-      <tr><th align="left">Avg time to first sale (s)</th><td>{snapshot['avg_time_to_first_sale_sec']}</td></tr>
+      <tr><th align="left">Time to FIRST sale from start (s)</th><td>{snapshot['time_to_first_sale_from_start_sec']}</td></tr>
+      <tr><th align="left">No-sale before FIRST sale</th><td>{snapshot['no_sale_before_first_sale']}</td></tr>
       <tr><th align="left">Avg sale interval (s)</th><td>{snapshot['avg_sale_interval_sec']}</td></tr>
-      <tr><th align="left">Avg no-sale before sale</th><td>{snapshot['avg_no_sale_before_sale']}</td></tr>
-      <tr><th align="left">Last no-sale before sale</th><td>{snapshot['last_no_sale_before_sale']}</td></tr>
-      <tr><th align="left">First sale samples</th><td>{snapshot['first_sale_samples']}</td></tr>
+      <tr><th align="left">Sale occurrences</th><td>{snapshot['sale_occurrences']}</td></tr>
+      <tr><th align="left">First sale seen?</th><td>{snapshot['first_sale_seen']}</td></tr>
     </table>
     """
 
@@ -596,9 +582,10 @@ def main_script():
                 sleep(8)
                 snap = stats.snapshot()
                 clog(logging.INFO, "STATS",
-                     f"SUCCESS snapshot: avg_sale_interval={snap['avg_sale_interval_sec']}s, "
-                     f"last_no_sale_before_sale={snap['last_no_sale_before_sale']} "
-                     f"(avg={snap['avg_no_sale_before_sale']}, first_sale_n={snap['first_sale_samples']})")
+                     f"SUCCESS snapshot: time_to_first_sale_from_start={snap['time_to_first_sale_from_start_sec']}s, "
+                     f"no_sale_before_first_sale={snap['no_sale_before_first_sale']}, "
+                     f"avg_sale_interval={snap['avg_sale_interval_sec']}s "
+                     f"(occurrences={snap['sale_occurrences']})")
                 # Notify by email
                 send_email_async_with_shot(snap)
                 _shutdown_now()
